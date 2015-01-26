@@ -1,6 +1,15 @@
 package org.elasticsearch.plugin.river.coherence;
 
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 import org.elasticsearch.action.admin.indices.create.CreateIndexRequestBuilder;
 import org.elasticsearch.action.bulk.BulkProcessor;
@@ -18,14 +27,14 @@ import org.elasticsearch.river.River;
 import org.elasticsearch.river.RiverName;
 import org.elasticsearch.river.RiverSettings;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.tangosol.net.CacheFactory;
 import com.tangosol.net.NamedCache;
-import com.tangosol.net.cache.ContinuousQueryCache;
+import com.tangosol.util.Filter;
 import com.tangosol.util.MapEvent;
 import com.tangosol.util.MapListener;
 import com.tangosol.util.QueryHelper;
+import com.tangosol.util.filter.LimitFilter;
 
 public class CoherenceRiver extends AbstractRiverComponent implements River
 {
@@ -39,13 +48,20 @@ public class CoherenceRiver extends AbstractRiverComponent implements River
 	private String type = DEFAULT_LABEL;
 	private String query = DEFAULT_QUERY;
 	private final BulkProcessor bulkProcessor;
-	private int bulkSize = 500;
+
+	private final ObjectMapper mapper = new ObjectMapper();
+	private final ExecutorService service = Executors.newSingleThreadExecutor();
+
+	private int bulkSize = 100;
 	private int bulkThreadLimit = 10;
 	private int bulkFlushInterval = 5;
+	private NamedCache cache;
+	private Callable<Void> indexerTask;
 
-	@SuppressWarnings("unused")
-	private ContinuousQueryCache cqc;
 	private String cacheName = DEFAULT_LABEL;
+
+	private Set<KeyOperation> keyOperationSet = Collections
+			.newSetFromMap(new ConcurrentHashMap<KeyOperation, Boolean>());
 
 	@Inject
 	protected CoherenceRiver(RiverName riverName, RiverSettings settings, Client client)
@@ -100,8 +116,65 @@ public class CoherenceRiver extends AbstractRiverComponent implements River
 			}
 		}).setBulkActions(bulkSize).setConcurrentRequests(bulkThreadLimit)
 				.setFlushInterval(TimeValue.timeValueSeconds(bulkFlushInterval)).build();
+
+		indexerTask = new Callable<Void>()
+		{
+			@Override
+			public Void call() throws Exception
+			{
+
+				List<KeyOperation> batch = new ArrayList<KeyOperation>();
+				while (true)
+				{
+					while (keyOperationSet.size() > 0)
+					{
+
+						int i = 0;
+						Iterator<KeyOperation> it = keyOperationSet.iterator();
+						while (i < bulkSize && it.hasNext())
+						{
+							batch.add(it.next());
+							it.remove();
+							i++;
+						}
+
+						for (KeyOperation keyOp : batch)
+						{
+							try
+							{
+								switch (keyOp.getType())
+								{
+								case MapEvent.ENTRY_DELETED:
+									bulkProcessor.add(new DeleteRequest(index, type, keyOp.getKey()
+											.toString()));
+									break;
+								default:
+									bulkProcessor.add(Requests
+											.indexRequest(index)
+											.type(type)
+											.id(keyOp.getKey().toString())
+											.source(mapper.writeValueAsString(cache.get(keyOp
+													.getKey()))).opType(OpType.INDEX));
+								}
+							}
+							catch (Exception ex)
+							{
+								logger.error("Error processing key {}", keyOp.getKey());
+							}
+
+						}
+						batch.clear();
+					}
+					synchronized (this)
+					{
+						wait();
+					}
+				}
+			}
+		};
 	}
 
+	@SuppressWarnings("unchecked")
 	@Override
 	public void start()
 	{
@@ -111,7 +184,7 @@ public class CoherenceRiver extends AbstractRiverComponent implements River
 					.prepareCreate(index);
 			createIndexRequest.execute().actionGet();
 		}
-		NamedCache cache;
+
 		if (configPath == null)
 		{
 			cache = CacheFactory.getCache(cacheName);
@@ -123,8 +196,24 @@ public class CoherenceRiver extends AbstractRiverComponent implements River
 					.getConfigurableCacheFactory(configPath, classLoader)
 					.ensureCache(cacheName, classLoader);
 		}
-		cqc = new ContinuousQueryCache(cache, QueryHelper.createFilter(query),
-				new DefaultListener());
+		Filter filter = QueryHelper.createFilter(query);
+		cache.addMapListener(new DefaultListener(), filter, true);
+		LimitFilter lFilter = new LimitFilter(filter, bulkSize * 4);
+		service.submit(indexerTask);
+		Set<Object> keys = null;
+		do
+		{
+			for (Object key : keys = cache.keySet(lFilter))
+			{
+				keyOperationSet.add(new KeyUpsert(key));
+			}
+			synchronized (indexerTask)
+			{
+				indexerTask.notify();
+			}
+			lFilter.nextPage();
+		} while (keys.size() > 0);
+
 	}
 
 	@Override
@@ -133,6 +222,7 @@ public class CoherenceRiver extends AbstractRiverComponent implements River
 		try
 		{
 			CacheFactory.shutdown();
+			service.shutdownNow();
 		}
 		catch (Exception ex)
 		{
@@ -142,35 +232,106 @@ public class CoherenceRiver extends AbstractRiverComponent implements River
 
 	private class DefaultListener implements MapListener
 	{
-		private ObjectMapper mapper = new ObjectMapper();
-
 		@Override
 		public void entryInserted(MapEvent paramMapEvent)
 		{
-			try
+			storeOp(new KeyUpsert(paramMapEvent.getKey()));
+		}
+
+		private void storeOp(KeyOperation keyOp)
+		{
+			keyOperationSet.add(keyOp);
+			synchronized (indexerTask)
 			{
-				bulkProcessor.add(Requests.indexRequest(index).type(type)
-						.id(paramMapEvent.getKey().toString())
-						.source(mapper.writeValueAsString(paramMapEvent.getNewValue()))
-						.opType(OpType.INDEX));
-			}
-			catch (JsonProcessingException ex)
-			{
-				logger.error("Error serializing object", ex, paramMapEvent.getNewValue());
+				indexerTask.notify();
 			}
 		}
 
 		@Override
 		public void entryUpdated(MapEvent paramMapEvent)
 		{
-			// Upsert
 			entryInserted(paramMapEvent);
 		}
 
 		@Override
 		public void entryDeleted(MapEvent paramMapEvent)
 		{
-			bulkProcessor.add(new DeleteRequest(index, type, paramMapEvent.getKey().toString()));
+			storeOp(new KeyDeletion(paramMapEvent.getKey()));
+		}
+
+	}
+
+	private static abstract class KeyOperation
+	{
+		Object key;
+
+		public KeyOperation(Object key)
+		{
+			this.key = key;
+		}
+
+		public Object getKey()
+		{
+			return key;
+		}
+
+		public abstract int getType();
+
+		@Override
+		public int hashCode()
+		{
+			final int prime = 31;
+			int result = 1;
+			result = prime * result + ((key == null) ? 0 : key.hashCode());
+			return result;
+		}
+
+		@Override
+		public boolean equals(Object obj)
+		{
+			if (this == obj)
+				return true;
+			if (obj == null)
+				return false;
+			if (getClass() != obj.getClass())
+				return false;
+			KeyOperation other = (KeyOperation) obj;
+			if (key == null)
+			{
+				if (other.key != null)
+					return false;
+			}
+			else if (!key.equals(other.key))
+				return false;
+			return true;
+		}
+	}
+
+	private static class KeyUpsert extends KeyOperation
+	{
+		public KeyUpsert(Object key)
+		{
+			super(key);
+		}
+
+		@Override
+		public int getType()
+		{
+			return MapEvent.ENTRY_INSERTED;
+		}
+	}
+
+	private static class KeyDeletion extends KeyOperation
+	{
+		public KeyDeletion(Object key)
+		{
+			super(key);
+		}
+
+		@Override
+		public int getType()
+		{
+			return MapEvent.ENTRY_DELETED;
 		}
 	}
 
