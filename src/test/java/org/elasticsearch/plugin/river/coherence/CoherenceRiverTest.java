@@ -152,6 +152,7 @@ public class CoherenceRiverTest extends ElasticsearchIntegrationTest
 		logger.info("Adding river \n{}", builder.string());
 		client().prepareIndex(RiverIndexName.Conf.DEFAULT_INDEX_NAME, "coherence_river_3", "_meta")
 				.setSource(builder).get();
+
 		checkCount("coherence", 301);
 	}
 
