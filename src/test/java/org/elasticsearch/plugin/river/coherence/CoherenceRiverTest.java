@@ -144,15 +144,15 @@ public class CoherenceRiverTest extends ElasticsearchIntegrationTest
 		builder.field("query", "key() between 500 and 800");
 		builder.endObject();
 		builder.endObject();
+
+		logger.info("Adding river \n{}", builder.string());
+		client().prepareIndex(RiverIndexName.Conf.DEFAULT_INDEX_NAME, "coherence_river_3", "_meta")
+				.setSource(builder).get();
 		// Add to cache
 		for (int i = 0; i < 1000; i++)
 		{
 			cache.put(i, getTestBean(1));
 		}
-		logger.info("Adding river \n{}", builder.string());
-		client().prepareIndex(RiverIndexName.Conf.DEFAULT_INDEX_NAME, "coherence_river_3", "_meta")
-				.setSource(builder).get();
-
 		checkCount("coherence", 301);
 	}
 

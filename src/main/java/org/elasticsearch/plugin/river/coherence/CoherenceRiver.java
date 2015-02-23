@@ -119,7 +119,9 @@ public class CoherenceRiver extends AbstractRiverComponent implements River
 				List<Entry<KeyOperation<Object>, Object>> batch = new ArrayList<>();
 				while (true)
 				{
+
 					batch = synchronizer.take();
+			
 					for (Entry<KeyOperation<Object>, Object> entry : batch)
 					{
 						KeyOperation<Object> keyOp = entry.getKey();

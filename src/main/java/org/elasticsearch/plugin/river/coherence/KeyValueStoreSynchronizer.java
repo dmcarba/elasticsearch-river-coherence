@@ -41,7 +41,7 @@ public abstract class KeyValueStoreSynchronizer<K, V> implements Synchronizer<K,
 		Iterator<K> iterator = initialKeySetIterator();
 		while (iterator.hasNext())
 		{
-			store.put(new KeyInsert<K>(iterator.next()), null);
+			put(new KeyInsert<K>(iterator.next()));
 		}		
 	}
 
@@ -68,11 +68,6 @@ public abstract class KeyValueStoreSynchronizer<K, V> implements Synchronizer<K,
 			}
 			return result;
 		}
-		catch(Exception ex)
-		{
-			ex.printStackTrace();
-			throw ex;
-		}
 		finally
 		{
 			lock.unlock();
@@ -82,7 +77,6 @@ public abstract class KeyValueStoreSynchronizer<K, V> implements Synchronizer<K,
 	protected void put(KeyOperation<K> keyop, V value)
 	{
 		lock.lock();
-
 		try
 		{
 			switch (keyop.getType())
